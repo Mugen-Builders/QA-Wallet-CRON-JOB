@@ -1,0 +1,1 @@
+rollups-contracts v3.0.0-alpha.10 (cc8485b4), compiled with solc 0.8.30; subsets of the forge out/ ABIs (functions/events used by the bot + every error)

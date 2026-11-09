@@ -1,0 +1,31 @@
+# systemd USER unit for qa-traffic-bot. Installed by scripts/install-user-unit.sh into
+# ~/.config/systemd/user/. Starts on boot (with `loginctl enable-linger`), restarts on failure,
+# and is killed and restarted by the watchdog if the loop stops beating for WatchdogSec.
+[Unit]
+Description=qa-traffic-bot: organic traffic for the qa-wallet-tester-app (sequencer) on Sepolia
+Documentation=file:@PROJECT@/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=20
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=@PROJECT@
+EnvironmentFile=%h/.config/qa-traffic-bot/config.env
+Environment=PYTHONPATH=@PROJECT@
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.foundry/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@PYTHON@ -m qatraffic run
+Restart=always
+RestartSec=20
+WatchdogSec=180
+TimeoutStartSec=180
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

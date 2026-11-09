@@ -1,0 +1,4 @@
+web3==7.16.0
+eth-account==0.13.7
+requests==2.32.5
+pytest==9.0.2
