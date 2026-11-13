@@ -217,6 +217,8 @@ python3 -m qatraffic accounts               # the population (addresses, persona
 python3 -m qatraffic plan --days 7          # preview: per-day totals, hour-of-day histogram, gaps
 python3 -m qatraffic report [--date D] [--send]
 python3 -m qatraffic discord-test           # posts one test message
+python3 -m qatraffic sweep                  # dry run: wallet ETH/TUSD + app-ledger balances
+python3 -m qatraffic sweep --execute        # return wallet ETH and TUSD to the funder (teardown)
 scripts/uninstall-user-unit.sh              # stop and remove the service (keeps config and state)
 ```
 

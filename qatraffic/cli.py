@@ -7,6 +7,7 @@
   plan           preview the traffic the seed produces (no chain access)
   report         build a daily report from the database (prints; --send queues it to Discord)
   discord-test   post one test message to the Discord webhook (outward: explicit only)
+  sweep          return leftover wallet ETH and TUSD to the funder (--execute to send)
   new-entropy    print 32 fresh random bytes for QA_TRAFFIC_ENTROPY
 """
 from __future__ import annotations
@@ -38,6 +39,14 @@ def cmd_run(_):
 
 def cmd_new_entropy(_):
     print(secrets.token_hex(32))
+
+
+def cmd_sweep(args):
+    from . import sweep
+    cfg = _cfg(require_secrets=True)
+    if not cfg.funder_key:
+        sys.exit("QA_TRAFFIC_FUNDER_KEY is not set")
+    sys.exit(sweep.run(cfg, execute=args.execute, to=args.to))
 
 
 def cmd_accounts(args):
@@ -317,6 +326,10 @@ def main(argv=None):
     s.add_argument("--send", action="store_true", help="also queue it to Discord")
     s.set_defaults(fn=cmd_report)
     sub.add_parser("discord-test").set_defaults(fn=cmd_discord_test)
+    s = sub.add_parser("sweep")
+    s.add_argument("--execute", action="store_true", help="actually send (default: dry run)")
+    s.add_argument("--to", default=None, help="destination address (default: the funder)")
+    s.set_defaults(fn=cmd_sweep)
     sub.add_parser("new-entropy").set_defaults(fn=cmd_new_entropy)
     args = p.parse_args(argv)
     args.fn(args)
