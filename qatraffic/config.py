@@ -141,6 +141,7 @@ class Config:
     initial_active_share: float
     onboarding_days: int
     time_scale: float
+    sweep_on_start: bool
     # vouchers
     exec_deadline_hours: float
     voucher_overdue_grace_minutes: float
@@ -292,6 +293,7 @@ def load(env=None, require_secrets: bool = True) -> Config:
         initial_active_share=_float(env, "QA_TRAFFIC_INITIAL_ACTIVE_SHARE", 0.6),
         onboarding_days=_int(env, "QA_TRAFFIC_ONBOARDING_DAYS", 21),
         time_scale=_float(env, "QA_TRAFFIC_TIME_SCALE", 1.0),
+        sweep_on_start=_bool(env, "QA_TRAFFIC_SWEEP_ON_START", False),
         exec_deadline_hours=_float(env, "QA_TRAFFIC_EXEC_DEADLINE_HOURS", 24.0),
         voucher_overdue_grace_minutes=_float(env, "QA_TRAFFIC_VOUCHER_OVERDUE_GRACE_MINUTES", 60.0),
         finality_lag_blocks=_int(env, "QA_TRAFFIC_FINALITY_LAG_BLOCKS", 96),

@@ -133,7 +133,71 @@ class Service:
         self.checks = Checks(ctx)
         self.engine.recover()
         self._handle_missed_sessions()
+        if self.cfg.sweep_on_start:
+            self._sweep_on_start()
         return True
+
+    def _sweep_on_start(self):
+        """Return leftover wallet ETH and TUSD to the funder, once, right after attaching.
+
+        Used on a headless host (e.g. fly.io) where there is no terminal to run `qatraffic sweep`:
+        every (re)start reclaims the wallets, then the usual lazy top-ups refill them before each
+        session. The transfers go through TxSender, so they are recorded and confirmed by the normal
+        loop (no blocking wait, no watchdog risk). A wallet with an in-flight tx this run is skipped,
+        and empty wallets cost nothing — so a crash-loop does not churn gas once the wallets are bare.
+        """
+        from .chain import FeeTooHigh, GWEI, InsufficientGas, Reverted, RpcAnswer, RpcUnavailable
+        from .sweep import ERC20_TRANSFER_GAS, ETH_SEND_GAS, _transfer_data, DUST_WEI
+        ctx = self.ctx
+        if ctx.funder is None:
+            return
+        dest = ctx.funder.address
+        tip = int(self.cfg.tip_min_gwei * GWEI)
+        try:
+            max_fee = ctx.sender.fees(tip).max_fee
+        except FeeTooHigh as e:
+            self.log.warn("sweep.skip", reason=str(e))
+            return
+        n_tok = n_eth = 0
+        tok_total = eth_total = 0
+        for w in ctx.wallets:
+            if self.db.q1("SELECT 1 FROM txs WHERE run_id=? AND sender=? AND status IN ('pending','sending') LIMIT 1",
+                          (ctx.run_id, w.address)):
+                continue  # don't race a tx we are about to rebroadcast
+            try:
+                tok = ctx.l1.token_balance(w.address)
+                bal = ctx.l1.eth_balance(w.address)
+            except RpcUnavailable:
+                continue
+            sent_tok = False
+            if tok > 0:
+                try:
+                    ctx.sender.send(w.key, w.address, w.slot, "sweep_tusd", self.cfg.token,
+                                    data=_transfer_data(dest, tok), gas=ERC20_TRANSFER_GAS, tip_wei=tip)
+                    sent_tok = True
+                    n_tok += 1
+                    tok_total += tok
+                except (Reverted, RpcAnswer, RpcUnavailable, InsufficientGas) as e:
+                    self.log.warn("sweep.tusd_failed", slot=w.slot, error=str(e)[:120])
+            # reserve gas for both the (pending) TUSD tx and this ETH tx
+            reserve = ((ERC20_TRANSFER_GAS if sent_tok else 0) + ETH_SEND_GAS) * max_fee
+            value = bal - reserve
+            if value > DUST_WEI:
+                try:
+                    ctx.sender.send(w.key, w.address, w.slot, "sweep_eth", dest, value=value,
+                                    gas=ETH_SEND_GAS, tip_wei=tip)
+                    n_eth += 1
+                    eth_total += value
+                except (Reverted, RpcAnswer, RpcUnavailable, InsufficientGas) as e:
+                    self.log.warn("sweep.eth_failed", slot=w.slot, error=str(e)[:120])
+        if n_tok or n_eth:
+            self.log.info("sweep.on_start", tusd_transfers=n_tok, eth_transfers=n_eth,
+                          tusd=tok_total / 10 ** 6, eth=eth_total / 10 ** 18, dest=dest)
+            self.outbox.lifecycle("Swept on start",
+                                  f"Returned leftover balances to the funder before running: "
+                                  f"**{tok_total / 10 ** 6:.6f} TUSD** from {n_tok} wallet(s), "
+                                  f"**{eth_total / 10 ** 18:.6f} ETH** from {n_eth} wallet(s). "
+                                  "Wallets refill lazily before their next session.")
 
     def _sequencer_identity(self) -> bool:
         """The sequencer must sign for this chain and this app (GET /domain), like a wallet checks

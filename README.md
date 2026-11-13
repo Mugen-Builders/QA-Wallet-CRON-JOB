@@ -219,6 +219,7 @@ python3 -m qatraffic report [--date D] [--send]
 python3 -m qatraffic discord-test           # posts one test message
 python3 -m qatraffic sweep                  # dry run: wallet ETH/TUSD + app-ledger balances
 python3 -m qatraffic sweep --execute        # return wallet ETH and TUSD to the funder (teardown)
+#   or set QA_TRAFFIC_SWEEP_ON_START=true to sweep automatically on every (re)start (headless hosts)
 scripts/uninstall-user-unit.sh              # stop and remove the service (keeps config and state)
 ```
 
