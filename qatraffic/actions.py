@@ -297,7 +297,7 @@ class Engine:
                     return False
                 to, data, gas_mult = plan
             elif kind == "gas_topup":
-                to, data, gas_mult = ctx.wallet(p["to"]).address, b"", 1.0
+                to, data, gas_mult = ctx.wallet(p["to"]).address, b"", 1.25
             else:
                 to, data, gas_mult = self._calldata(st, p, now_v)
                 if to is None:
@@ -307,8 +307,11 @@ class Engine:
             sender = ctx.funder if st["slot"] is None else ctx.wallet(st["slot"])
             tip = int((ctx.profiles[st["slot"]].tip_gwei if st["slot"] is not None else ctx.cfg.tip_max_gwei) * 1e9)
             ctx.db.x("UPDATE steps SET status='sending', updated_at=? WHERE id=?", (time.time(), st["id"]))
+            # gas_topup is a plain value transfer; estimate it rather than assuming 21000, because
+            # funding a never-seen account costs more on chains that price account creation (some
+            # testnets charge ~200k gas the first time an address receives value).
             tx_id = ctx.sender.send(sender.key, sender.address, st["slot"], kind, to, data,
-                                    value=int(p.get("value", 0)), tip_wei=tip, gas=21000 if kind == "gas_topup" else None,
+                                    value=int(p.get("value", 0)), tip_wei=tip, gas=None,
                                     gas_mult=gas_mult, step_id=st["id"])
             ctx.db.x("UPDATE steps SET status='sent', tx_id=?, updated_at=? WHERE id=?", (tx_id, time.time(), st["id"]))
             if kind == "execute":
