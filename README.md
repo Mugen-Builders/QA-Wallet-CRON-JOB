@@ -178,7 +178,11 @@ logged.
 
 - `systemctl --user status qa-traffic-bot`: the status line shows the bot's own summary.
 - `journalctl --user -u qa-traffic-bot -f`: one line per event, with journald priorities (`-p warning`).
-- `var/logs/events-YYYY-MM-DD.jsonl`: one JSON object per event.
+  On a plain container (e.g. fly.io) the same lines go to stdout without the `<N>` prefix — read them
+  with that platform's log viewer (`fly logs`).
+- `var/logs/events-YYYY-MM-DD.jsonl`: one JSON object per event (0600, one file per UTC day). Set
+  `QA_TRAFFIC_LOG_LEVEL` (debug|info|warn|error) to change verbosity and `QA_TRAFFIC_LOG_RETENTION_DAYS`
+  to bound how many daily files are kept. RPC URLs and 32-byte hex (keys) are scrubbed from free text.
 - `var/state/heartbeat.json`: rewritten every loop.
 - `python3 -m qatraffic status [-v]`: exit 0 = healthy, 1 = stale, 2 = never ran.
 - The watchdog restarts the process if the loop stops for 3 minutes. On every start the bot posts

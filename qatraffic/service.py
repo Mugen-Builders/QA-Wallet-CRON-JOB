@@ -43,7 +43,7 @@ class Service:
     def __init__(self, cfg):
         self.cfg = cfg
         self.stop = False
-        self.log = EventLog(cfg.log_dir)
+        self.log = EventLog(cfg.log_dir, min_level=cfg.log_level, retention_days=cfg.log_retention_days)
         self.db = DB(cfg.db_path)
         self.outbox = Outbox(self.db, self.log, cfg.discord_webhook_url, cfg.discord_prefix)
         self.alerts = Alerts(self.db, self.log, self.outbox, cfg.alert_repeat_hours)

@@ -172,6 +172,9 @@ class Config:
     report_tz: ZoneInfo
     alert_repeat_hours: float
     healthcheck_url: str | None = field(repr=False)
+    # logging
+    log_level: str = "info"
+    log_retention_days: int = 14
 
     @property
     def db_path(self) -> Path:
@@ -320,6 +323,8 @@ def load(env=None, require_secrets: bool = True) -> Config:
         report_tz=tz,
         alert_repeat_hours=_float(env, "QA_TRAFFIC_ALERT_REPEAT_HOURS", 6.0),
         healthcheck_url=_env(env, "QA_TRAFFIC_HEALTHCHECK_URL"),
+        log_level=(_env(env, "QA_TRAFFIC_LOG_LEVEL", "info") or "info").lower(),
+        log_retention_days=_int(env, "QA_TRAFFIC_LOG_RETENTION_DAYS", 14),
     )
     _validate(cfg)
     return cfg
@@ -340,6 +345,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("QA_TRAFFIC_INVALID_RATE above 0.05 is not 'minimal'; refusing")
     if cfg.time_scale <= 0:
         raise ConfigError("QA_TRAFFIC_TIME_SCALE must be > 0")
+    if cfg.log_level not in ("debug", "info", "warn", "error", "critical"):
+        raise ConfigError("QA_TRAFFIC_LOG_LEVEL must be one of debug, info, warn, error, critical")
+    if cfg.log_retention_days < 1:
+        raise ConfigError("QA_TRAFFIC_LOG_RETENTION_DAYS must be >= 1")
     if cfg.gas_topup_min_eth > cfg.gas_topup_max_eth:
         raise ConfigError("GAS_TOPUP_MIN_ETH must be <= GAS_TOPUP_MAX_ETH")
     if cfg.tip_min_gwei > cfg.tip_max_gwei:

@@ -26,11 +26,15 @@ def scrub(text: str) -> str:
 
 
 class EventLog:
-    def __init__(self, log_dir: Path, min_level: str = "info", stdout=None):
+    def __init__(self, log_dir: Path, min_level: str = "info", stdout=None, retention_days: int = 14):
         self.dir = log_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self.min = LEVELS.get(min_level, 20)
         self.out = stdout or sys.stdout
+        self.retention_days = retention_days
+        # Under systemd/journald the "<N>" priority prefix lets `journalctl -p` filter by level;
+        # anywhere else (a plain container like fly.io, a terminal) it is just noise, so drop it.
+        self.journald = bool(os.environ.get("JOURNAL_STREAM"))
         self.lock = threading.Lock()
         self._fh = None
         self._day = None
@@ -45,7 +49,20 @@ class EventLog:
             self._fh = open(path, "a", buffering=1)
             os.chmod(path, 0o600)
             self._day = day
+            self._prune()
         return self._fh
+
+    def _prune(self):
+        """Keep only the last `retention_days` daily files so logs do not grow without bound."""
+        try:
+            files = sorted(self.dir.glob("events-*.jsonl"))
+        except OSError:
+            return
+        for p in files[:-self.retention_days] if self.retention_days > 0 else []:
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     def emit(self, level: str, event: str, msg: str = "", **fields):
         lv = LEVELS.get(level, 20)
@@ -63,14 +80,16 @@ class EventLog:
         extra = " ".join(f"{k}={rec[k]}" for k in fields if k not in ("detail",))
         if extra:
             human += " | " + extra
-        # systemd/journald priority prefix (<N>) so `journalctl -p warning` works
-        prio = {"debug": 7, "info": 6, "warn": 4, "error": 3, "critical": 2}.get(level, 6)
+        # systemd/journald priority prefix (<N>) so `journalctl -p warning` works; omitted elsewhere
+        if self.journald:
+            prio = {"debug": 7, "info": 6, "warn": 4, "error": 3, "critical": 2}.get(level, 6)
+            human = f"<{prio}>{human}"
         with self.lock:
             try:
                 self._file().write(line + "\n")
             except OSError:
                 pass
-            print(f"<{prio}>{human}", file=self.out, flush=True)
+            print(human, file=self.out, flush=True)
 
     def debug(self, event, msg="", **f):
         self.emit("debug", event, msg, **f)
