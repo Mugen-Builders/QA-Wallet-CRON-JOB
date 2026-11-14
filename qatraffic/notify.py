@@ -68,11 +68,85 @@ class Outbox:
         self._enqueue("report", {"content": f"{self.prefix} daily report", "embeds": [embed],
                                  "allowed_mentions": {"parse": []}}, attachment)
 
+    # ---- staleness pruning ----
+    @staticmethod
+    def _is_resolved_embed(e: dict) -> bool:
+        # outbox.alerts() always prefixes a resolve embed's title with "RESOLVED ·".
+        return str(e.get("title", "")).startswith("RESOLVED ·")
+
+    @staticmethod
+    def _embed_key(e: dict) -> str | None:
+        # outbox.alerts() stores the alert key verbatim in the embed footer.
+        return (e.get("footer") or {}).get("text")
+
+    def _prune_stale(self, now: float):
+        """Drop queued *firing* alert embeds that are no longer worth delivering, so reconnecting
+        after an outage (or a restart off a persistent disk) does not replay hours of stale alerts:
+          (a) the alert has since resolved — the firing message is moot; its separate "resolved"
+              message still goes out, so the Discord timeline closes cleanly;
+          (b) a newer queued firing message for the same key exists — collapse the
+              open/repeat/escalated ladder down to its latest state (one message per key).
+        "RESOLVED ·" embeds are always kept. A row left with no embeds is marked sent (dropped)
+        without posting; a partially-pruned row keeps its surviving embeds and has its header
+        ("alert" vs "update") recomputed. Non-alert rows (lifecycle, report) are untouched."""
+        rows = self.db.q("SELECT id, created_at, payload FROM outbox "
+                         "WHERE sent_at IS NULL AND kind='alert' AND attempts < ? ORDER BY id",
+                         (self.MAX_ATTEMPTS,))
+        if not rows:
+            return
+        resolved = {r["key"] for r in self.db.q("SELECT key FROM alerts WHERE resolved_at IS NOT NULL")}
+        # newest row id carrying a live firing embed for each still-open key
+        newest_firing: dict[str, int] = {}
+        parsed = []
+        for r in rows:
+            try:
+                body = json.loads(r["payload"])
+            except (ValueError, TypeError):
+                continue
+            embeds = body.get("embeds") or []
+            parsed.append((r, body, embeds))
+            for e in embeds:
+                if self._is_resolved_embed(e):
+                    continue
+                k = self._embed_key(e)
+                if k and k not in resolved:
+                    newest_firing[k] = r["id"]
+        dropped = collapsed = 0
+        for r, body, embeds in parsed:
+            kept = []
+            for e in embeds:
+                if self._is_resolved_embed(e):
+                    kept.append(e)
+                    continue
+                k = self._embed_key(e)
+                if k is None:  # unclassifiable — keep it, a dupe beats a lost alert
+                    kept.append(e)
+                    continue
+                if k in resolved:  # alert resolved while this waited -> moot
+                    dropped += 1
+                    continue
+                if newest_firing.get(k) != r["id"]:  # a fresher firing message exists -> collapse
+                    collapsed += 1
+                    continue
+                kept.append(e)
+            if len(kept) == len(embeds):
+                continue
+            if not kept:
+                self.db.x("UPDATE outbox SET sent_at=?, last_error=? WHERE id=?",
+                          (now, "superseded: stale alerts pruned on drain", r["id"]))
+            else:
+                has_firing = any(not self._is_resolved_embed(e) for e in kept)
+                body = dict(body, embeds=kept, content=self.prefix + (" alert" if has_firing else " update"))
+                self.db.x("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(body), r["id"]))
+        if dropped or collapsed:
+            self.log.info("discord.pruned_stale", dropped=dropped, collapsed=collapsed)
+
     # ---- delivery ----
     def flush(self, max_messages: int = 5):
         if not self.url:
             return
         now = time.time()
+        self._prune_stale(now)
         rows = self.db.q("SELECT * FROM outbox WHERE sent_at IS NULL AND attempts < ? AND next_attempt_at <= ? ORDER BY id LIMIT ?",
                          (self.MAX_ATTEMPTS, now, max_messages))
         for r in rows:
