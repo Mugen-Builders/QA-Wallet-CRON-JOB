@@ -124,8 +124,17 @@ class Vouchers:
         last = un(ep.get("last_block"))
         if staged and sp is not None:
             target = staged + sp + 2
+        elif sp is None and last is not None:
+            # PRT (Dave): the consensus contract exposes no staging period, so there is no
+            # on-chain claim+dispute window to read. Estimate executability as the epoch's last
+            # block plus the configured settlement budget (measured ~18-19 h on this deployment),
+            # instead of the ~finality-lag fallback that assumed near-immediate executability and
+            # fired the overdue warning hours before a PRT epoch could realistically settle.
+            # Unclamped on purpose: once an epoch is past the budget the estimate goes into the
+            # past, which is what lets _maybe_overdue flag a genuinely stuck PRT epoch.
+            return time.time() + (last + int(ctx.cfg.prt_settle_hours * 3600 / bt) - head) * bt
         elif last is not None:
-            target = last + ctx.cfg.finality_lag_blocks + (sp or 0) + 4
+            target = last + ctx.cfg.finality_lag_blocks + sp + 4
         else:
             return None
         return time.time() + max(0, target - head) * bt
@@ -134,6 +143,7 @@ class Vouchers:
     def update(self):
         ctx = self.ctx
         now = time.time()
+        any_overdue = False
         for v in ctx.db.q("SELECT * FROM vouchers WHERE run_id=? AND state='waiting' ORDER BY output_index", (ctx.run_id,)):
             try:
                 if ctx.l1.was_output_executed(v["output_index"]):
@@ -141,37 +151,67 @@ class Vouchers:
                     continue
                 o = ctx.node.get_output(v["output_index"])
             except (RpcUnavailable, NodeError, NodeUnavailable):
-                return
+                return  # incomplete sweep: leave the alert state untouched
             sib = (o or {}).get("output_hashes_siblings")
             if sib:
                 try:
                     ctx.l1.validate_output(_b(v["raw_output"]), v["output_index"], [_b(x) for x in sib])
                 except Reverted:
-                    self._maybe_overdue(v, now)
+                    # The node has the output proof but the on-chain claim is not accepted yet
+                    # (a PRT epoch still in its dispute/settlement window). Refresh the estimate
+                    # the same way as the no-proof case before judging it overdue.
+                    v = self._refresh_eta(v, now)
+                    any_overdue |= self._maybe_overdue(v, now)
                     continue
                 except RpcUnavailable:
                     return
                 self._mark_due(v)
             else:
-                if v["eta_at"] is None or now - v["found_at"] > 1800 and v["eta_at"] < now:
-                    eta = self._eta(v["epoch_index"])
-                    if eta:
-                        ctx.db.x("UPDATE vouchers SET eta_at=? WHERE run_id=? AND output_index=?",
-                                 (eta, ctx.run_id, v["output_index"]))
-                self._maybe_overdue(v, now)
+                v = self._refresh_eta(v, now)
+                any_overdue |= self._maybe_overdue(v, now)
+        # Reached the end only if the sweep completed (RPC errors return early above): if nothing is
+        # currently past its estimate, clear the overdue warning.
+        if not any_overdue:
+            ctx.alerts.resolve("voucher.overdue", "no voucher is past its executability estimate")
 
-    def _maybe_overdue(self, v, now):
+    def _refresh_eta(self, v, now):
+        """Re-estimate a waiting voucher's executability time when the stored one is missing or
+        stale. If no fresh estimate can be produced (e.g. the epoch has no last block yet) and the
+        stored one is already in the past, drop it to None so a leftover stale value cannot fire a
+        false overdue; it will be recomputed on a later cycle. Returns the (possibly updated) row."""
+        ctx = self.ctx
+        if not (v["eta_at"] is None or (now - v["found_at"] > 1800 and v["eta_at"] < now)):
+            return v
+        eta = self._eta(v["epoch_index"])
+        if eta:
+            ctx.db.x("UPDATE vouchers SET eta_at=? WHERE run_id=? AND output_index=?", (eta, ctx.run_id, v["output_index"]))
+            return dict(v, eta_at=eta)
+        if v["eta_at"] is not None and v["eta_at"] < now:
+            ctx.db.x("UPDATE vouchers SET eta_at=NULL WHERE run_id=? AND output_index=?", (ctx.run_id, v["output_index"]))
+            return dict(v, eta_at=None)
+        return v
+
+    def _maybe_overdue(self, v, now) -> bool:
+        """Return whether this waiting voucher is currently past its executability estimate. Also
+        clears a stale overdue flag when a refreshed estimate (e.g. after PRT recalibration) puts
+        the voucher back in the future, so the alert can resolve."""
         ctx = self.ctx
         if v["eta_at"] is None:
-            return
+            if v["overdue_alerted"]:
+                ctx.db.x("UPDATE vouchers SET overdue_alerted=0 WHERE run_id=? AND output_index=?", (ctx.run_id, v["output_index"]))
+            return False
         grace = ctx.cfg.voucher_overdue_grace_minutes * 60
-        if now > v["eta_at"] + grace:
-            late_min = (now - v["eta_at"]) / 60
-            ctx.alerts.raise_("voucher.overdue", "warning", "Vouchers are not executable past their expected time",
-                              self._overdue_summary())
-            if not v["overdue_alerted"]:
-                ctx.db.x("UPDATE vouchers SET overdue_alerted=1 WHERE run_id=? AND output_index=?", (ctx.run_id, v["output_index"]))
-                ctx.log.warn("voucher.overdue", output_index=v["output_index"], late_min=round(late_min))
+        if now <= v["eta_at"] + grace:
+            if v["overdue_alerted"]:
+                ctx.db.x("UPDATE vouchers SET overdue_alerted=0 WHERE run_id=? AND output_index=?", (ctx.run_id, v["output_index"]))
+            return False
+        late_min = (now - v["eta_at"]) / 60
+        ctx.alerts.raise_("voucher.overdue", "warning", "Vouchers are not executable past their expected time",
+                          self._overdue_summary())
+        if not v["overdue_alerted"]:
+            ctx.db.x("UPDATE vouchers SET overdue_alerted=1 WHERE run_id=? AND output_index=?", (ctx.run_id, v["output_index"]))
+            ctx.log.warn("voucher.overdue", output_index=v["output_index"], late_min=round(late_min))
+        return True
 
     def _overdue_summary(self):
         ctx = self.ctx

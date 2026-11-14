@@ -145,6 +145,7 @@ class Config:
     # vouchers
     exec_deadline_hours: float
     voucher_overdue_grace_minutes: float
+    prt_settle_hours: float
     finality_lag_blocks: int
     block_time_seconds: float
     # fees and gas funding (ETH / gwei)
@@ -299,6 +300,7 @@ def load(env=None, require_secrets: bool = True) -> Config:
         sweep_on_start=_bool(env, "QA_TRAFFIC_SWEEP_ON_START", False),
         exec_deadline_hours=_float(env, "QA_TRAFFIC_EXEC_DEADLINE_HOURS", 24.0),
         voucher_overdue_grace_minutes=_float(env, "QA_TRAFFIC_VOUCHER_OVERDUE_GRACE_MINUTES", 60.0),
+        prt_settle_hours=_float(env, "QA_TRAFFIC_PRT_SETTLE_HOURS", 20.0),
         finality_lag_blocks=_int(env, "QA_TRAFFIC_FINALITY_LAG_BLOCKS", 96),
         block_time_seconds=_float(env, "QA_TRAFFIC_BLOCK_TIME_SECONDS", 12.0),
         max_fee_gwei=_float(env, "QA_TRAFFIC_MAX_FEE_GWEI", 30.0),
@@ -357,3 +359,5 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("QA_TRAFFIC_LOG_CHUNK_BLOCKS must be >= 1")
     if cfg.max_op_fee_usdc <= 0:
         raise ConfigError("QA_TRAFFIC_MAX_OP_FEE_USDC must be > 0")
+    if cfg.prt_settle_hours <= 0:
+        raise ConfigError("QA_TRAFFIC_PRT_SETTLE_HOURS must be > 0")
