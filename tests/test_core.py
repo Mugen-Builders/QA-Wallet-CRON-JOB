@@ -236,6 +236,28 @@ def test_alert_lifecycle_and_discord_delivery(tmp_path, hook, monkeypatch):
     assert "secret" not in logs
 
 
+def test_stale_firing_alerts_pruned_but_resolution_kept(tmp_path, hook):
+    # An alert fires and resolves while Discord is unreachable, so both messages sit queued. On
+    # reconnect the stale *firing* message is moot (its key already resolved) and must be dropped,
+    # but the resolution still goes out so the timeline closes. (A fresh escalate->resolve inside
+    # one drain is the opposite case and is covered by test_alert_lifecycle_and_discord_delivery.)
+    db = DB(tmp_path / "s.sqlite3")
+    log = EventLog(tmp_path / "logs", stdout=open(os.devnull, "w"))
+    ob = Outbox(db, log, hook, "[t]")
+    al = Alerts(db, log, ob, repeat_hours=6)
+    al.raise_("rpc.l1", "warning", "L1 down", "x")
+    al.flush()
+    al.resolve("rpc.l1", "back")
+    al.flush()
+    # age the queued firing message past the backlog threshold without delivering it yet
+    db.x("UPDATE outbox SET created_at = created_at - ? WHERE kind='alert'", (Outbox.STALE_AFTER_S + 60,))
+    ob.flush(max_messages=50)
+    titles = [e["title"] for c in _Hook.calls for e in json.loads(c[1]).get("embeds", [])]
+    assert not any(t.startswith("WARNING") for t in titles)   # stale firing message dropped
+    assert any(t.startswith("RESOLVED") for t in titles)      # resolution still delivered
+    assert ob.pending_count() == 0
+
+
 def test_scrub():
     assert "<url>" in scrub("failed https://eth-sepolia.example/v3/abcdef")
     assert "<hex32>" in scrub("key 0x" + "ab" * 32)

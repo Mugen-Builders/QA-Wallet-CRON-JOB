@@ -594,6 +594,18 @@ class Engine:
         tx = ctx.db.q1("SELECT * FROM txs WHERE id=?", (tx_id,))
         kind = st["kind"]
         if tx["status"] == "dropped":
+            reason = tx["revert"] or ""
+            # "nonce consumed by another transaction" means SOME tx at this account+nonce mined. For
+            # an input (deposit/transfer/withdraw) that may be THIS input landing under a racing
+            # hash (common right after an RPC wobble). Resending would duplicate a possibly-landed
+            # input -- a double deposit, or worse a double withdrawal. So do NOT resend it: if it did
+            # land, canon.orphans() reconciles it from chain; if it did not, the planner reschedules
+            # by need. Only inputs take this path; execute/gas_topup keep the resend behaviour below.
+            if kind in INPUT_KINDS and reason.startswith("nonce consumed"):
+                self._finish(st, "failed", "dropped: nonce consumed by another tx; not resent "
+                                           "(may have landed -- left for canonical reconcile)")
+                ctx.log.warn("tx.dropped_nonce_consumed", step=st["id"], slot=st["slot"], kind=kind, tx=tx_id)
+                return
             attempts = json.loads(st["params"]).get("attempts", 0) + 1
             if attempts <= 3:
                 p = dict(json.loads(st["params"]), attempts=attempts)
@@ -634,6 +646,10 @@ class Engine:
             self.vouchers.on_exec_mined(json.loads(st["params"])["output_index"], receipt, st["slot"])
         elif kind == "gas_topup":
             self.funding.on_topup_mined(json.loads(st["params"])["to"])
+        # A later success of the same kind clears a prior one-off revert alert so it does not linger
+        # and re-ping every repeat window (these are point-in-time events, not ongoing conditions).
+        ctx.alerts.resolve(f"tx.reverted.{kind}", f"a later {kind} transaction mined")
+        ctx.alerts.resolve(f"step.revert.{kind}", f"a later {kind} step succeeded")
         self._finish(st, "mined")
 
     def recover(self):

@@ -23,6 +23,11 @@ def _ts(t=None) -> str:
 
 class Outbox:
     MAX_ATTEMPTS = 30
+    # A firing alert embed counts as a stale *backlog* replay (droppable once its key has resolved)
+    # only after it has waited this long undelivered. Below it, a fresh escalate->resolve inside one
+    # drain still delivers the firing embed, so a real spike is never silently swallowed. The flood
+    # this guards against was tens of minutes of queued alerts replayed after a connectivity gap.
+    STALE_AFTER_S = 300.0
 
     def __init__(self, db, log, webhook_url: str | None, prefix: str):
         self.db, self.log = db, log
@@ -82,8 +87,10 @@ class Outbox:
     def _prune_stale(self, now: float):
         """Drop queued *firing* alert embeds that are no longer worth delivering, so reconnecting
         after an outage (or a restart off a persistent disk) does not replay hours of stale alerts:
-          (a) the alert has since resolved — the firing message is moot; its separate "resolved"
-              message still goes out, so the Discord timeline closes cleanly;
+          (a) the alert has since resolved AND the firing message has waited longer than
+              STALE_AFTER_S — the stale firing message is moot; its separate "resolved" message
+              still goes out, so the Discord timeline closes cleanly. A fresh escalate->resolve
+              inside one drain is kept, so a real spike is never swallowed;
           (b) a newer queued firing message for the same key exists — collapse the
               open/repeat/escalated ladder down to its latest state (one message per key).
         "RESOLVED ·" embeds are always kept. A row left with no embeds is marked sent (dropped)
@@ -113,6 +120,10 @@ class Outbox:
                     newest_firing[k] = r["id"]
         dropped = collapsed = 0
         for r, body, embeds in parsed:
+            # Only prune rows that have waited long enough to be a backlog replay. A fresh row is a
+            # live transition (e.g. an escalation that resolved seconds later) and is delivered as
+            # is, so a real spike is never swallowed; the flood this guards against was minutes old.
+            stale = (now - r["created_at"]) > self.STALE_AFTER_S
             kept = []
             for e in embeds:
                 if self._is_resolved_embed(e):
@@ -122,10 +133,13 @@ class Outbox:
                 if k is None:  # unclassifiable — keep it, a dupe beats a lost alert
                     kept.append(e)
                     continue
-                if k in resolved:  # alert resolved while this waited -> moot
+                if not stale:  # fresh firing embed -> always deliver
+                    kept.append(e)
+                    continue
+                if k in resolved:  # stale firing message whose alert already resolved -> moot
                     dropped += 1
                     continue
-                if newest_firing.get(k) != r["id"]:  # a fresher firing message exists -> collapse
+                if newest_firing.get(k) != r["id"]:  # stale, and a fresher firing message exists -> collapse
                     collapsed += 1
                     continue
                 kept.append(e)

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
@@ -33,6 +35,52 @@ class Health:
         self.started = time.time()
         self._last_ping = 0.0
         self.last_ok = None
+        self._httpd = None
+
+    def serve_http(self):
+        """Start a tiny HTTP liveness endpoint in a daemon thread (off unless QA_TRAFFIC_HEALTH_PORT).
+
+        A GET to any path returns 200 while the loop is making progress and 503 once `last_ok` is
+        stale -- i.e. the loop is wedged even though the process (and the systemd watchdog, if any)
+        still appear up. On fly.io, where there is no systemd watchdog, wiring fly.toml's [[checks]]
+        at this port is what restarts a frozen Machine. Bound to 0.0.0.0 for the platform prober.
+        """
+        port = getattr(self.cfg, "health_port", 0)
+        if not port:
+            return None
+        max_stale = getattr(self.cfg, "health_max_stale_seconds", 600.0)
+        health = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):  # keep the prober out of the logs
+                pass
+
+            def do_GET(self):
+                now = time.time()
+                # Before the first OK beat, allow a startup grace measured from process start.
+                ref = health.last_ok if health.last_ok is not None else health.started
+                age = now - ref
+                ok = age < max_stale
+                body = json.dumps({
+                    "ok": ok, "last_ok_age_s": round(age, 1), "max_stale_s": max_stale,
+                    "pid": os.getpid(), "uptime_s": round(now - health.started, 1),
+                }).encode()
+                self.send_response(200 if ok else 503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_HEAD = do_GET
+
+        try:
+            self._httpd = ThreadingHTTPServer(("0.0.0.0", int(port)), Handler)
+        except OSError as e:
+            self.log.error("health.http_bind_failed", port=port, error=str(e))
+            return None
+        threading.Thread(target=self._httpd.serve_forever, name="health-http", daemon=True).start()
+        self.log.info("health.http_serving", port=int(port), max_stale_s=max_stale)
+        return self._httpd
 
     def startup_gap(self) -> float | None:
         """Seconds since the previous process's last heartbeat (None on first start). Records a

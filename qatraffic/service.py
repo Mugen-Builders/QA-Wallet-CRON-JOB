@@ -72,6 +72,7 @@ class Service:
         self.ctx = Ctx(cfg=cfg, db=self.db, log=self.log, l1=l1, node=Node(cfg, self.db, self.log) if cfg.app_configured else None,
                        seq=Sequencer(cfg, self.db, self.log) if cfg.app_configured else None, wallets=wallets, profiles=profiles, run_id=None, clock=Clock(time.time(), cfg.time_scale),
                        alerts=self.alerts, plan_seed=seed, funder=funder)
+        self.health.serve_http()
         sd_notify("READY=1\nSTATUS=starting")
         self._announce_start(gap)
 
@@ -88,9 +89,18 @@ class Service:
             self.outbox.lifecycle("Restarted", f"Restarted after {gap:.0f} s.", fields)
 
     def _attach_run(self) -> bool:
-        """Bind to the deployed app. Returns False while waiting (app not set / no code yet)."""
+        """Bind to the deployed app. Returns False while waiting (app not set / no code yet).
+
+        A run counts as attached only once canon, funding, vouchers, the engine and the checks are
+        ALL built. The shortcut below therefore gates on ctx.canon, not just ctx.run_id: if attach
+        fails partway (most often a transient RPC drop mid-build), _attach_rollback() clears run_id
+        AND canon so the next loop retries from scratch. Without that, a half-built Service would
+        slip past a `run_id is not None` shortcut and the loop would crash on `self.vouchers` /
+        `ctx.canon.sync()` every tick -- a silent freeze the watchdog never notices (it still beats).
+        bootstrap_run() resumes the existing open run, so retrying attach never duplicates a run.
+        """
         ctx = self.ctx
-        if ctx.run_id is not None:
+        if ctx.run_id is not None and ctx.canon is not None:
             return True
         cfg = self.cfg
         if not cfg.app_configured:
@@ -108,34 +118,52 @@ class Service:
         self.alerts.resolve("app.not_deployed", "contract found")
         if not self._sequencer_identity():
             return False
-        run_id, clock_start = bootstrap_run(cfg, self.db, self.log, ctx.l1, ctx.wallets, ctx.profiles)
-        ctx.run_id = run_id
-        ctx.clock = Clock(clock_start, cfg.time_scale)
-        ctx.profiles = load_profiles(self.db, run_id) or ctx.profiles
-        ctx.sender = TxSender(cfg, self.db, self.log, ctx.l1, run_id)
-        el, sp = ctx.l1.consensus_timing()
-        ctx.timing = {"epoch_length": el, "staging": sp}
-        ctx.paused_reason = None
-        canon = Canon(ctx)
         try:
+            run_id, clock_start = bootstrap_run(cfg, self.db, self.log, ctx.l1, ctx.wallets, ctx.profiles)
+            ctx.run_id = run_id
+            ctx.clock = Clock(clock_start, cfg.time_scale)
+            ctx.profiles = load_profiles(self.db, run_id) or ctx.profiles
+            ctx.sender = TxSender(cfg, self.db, self.log, ctx.l1, run_id)
+            el, sp = ctx.l1.consensus_timing()
+            ctx.timing = {"epoch_length": el, "staging": sp}
+            canon = Canon(ctx)
             canon.start()
+            ctx.canon = canon
+            self.funding = Funding(ctx)
+            self.vouchers = Vouchers(ctx)
+            self.engine = Engine(ctx, self.funding, self.vouchers)
+            self.checks = Checks(ctx)
+            self.engine.recover()
+            self._handle_missed_sessions()
+            if self.cfg.sweep_on_start:
+                self._sweep_on_start()
         except (CanonError, NodeError, NodeUnavailable) as e:
-            ctx.run_id = None
+            self._attach_rollback()
             ctx.paused_reason = f"canonical model: {e}"
             self.alerts.raise_("canon.start", "error", "The bot cannot build its model of the app", str(e)[:400])
             return False
+        except Exception as e:  # noqa: BLE001 - a half-built run must never persist behind the shortcut
+            self._attach_rollback()
+            ctx.paused_reason = f"attach failed: {type(e).__name__}"
+            self.log.warn("attach.failed", error=f"{type(e).__name__}: {e}", detail=traceback.format_exc()[-1200:])
+            self.alerts.raise_("attach.retry", "warning", "The bot could not attach to the app yet",
+                               f"{type(e).__name__}: {str(e)[:300]} -- retrying")
+            return False
+        ctx.paused_reason = None
         self.alerts.resolve("canon.start", "model built")
-        ctx.canon = canon
-        self.log.info("run.attached", run_id=run_id, epoch_length=el, staging=sp, sequencer=canon.sequencer)
-        self.funding = Funding(ctx)
-        self.vouchers = Vouchers(ctx)
-        self.engine = Engine(ctx, self.funding, self.vouchers)
-        self.checks = Checks(ctx)
-        self.engine.recover()
-        self._handle_missed_sessions()
-        if self.cfg.sweep_on_start:
-            self._sweep_on_start()
+        self.alerts.resolve("attach.retry", "attached")
+        self.log.info("run.attached", run_id=ctx.run_id, epoch_length=ctx.timing.get("epoch_length"),
+                      staging=ctx.timing.get("staging"), sequencer=ctx.canon.sequencer)
         return True
+
+    def _attach_rollback(self):
+        """Discard a partially-built run so _attach_run() retries cleanly on the next loop."""
+        ctx = self.ctx
+        ctx.run_id = None
+        ctx.canon = None
+        for attr in ("engine", "vouchers", "funding", "checks"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def _sweep_on_start(self):
         """Return leftover wallet ETH and TUSD to the funder, once, right after attaching.
@@ -334,6 +362,10 @@ class Service:
             except Exception as e:  # noqa: BLE001
                 ok = False
                 self.log.error("loop.error_tail", error=f"{type(e).__name__}: {e}")
+            if ok:
+                # A clean pass clears a transient loop error so it does not linger and re-ping; a
+                # persistent fault re-raises on the next iteration anyway.
+                self.alerts.resolve("bot.loop_error", "the loop recovered")
             self.health.beat(ok, self._status())
             elapsed = time.time() - t_iter
             if elapsed > 120:

@@ -274,14 +274,39 @@ def test_canon_binds_deposits_to_the_depositor_and_projects_spendable(tmp_path):
     assert c.pending_nonce(0) == 1
 
 
-def test_canon_late_binding_and_orphans(tmp_path):
+def test_canon_late_bind_reconcile_and_foreign(tmp_path):
     c, ctx = _canon(tmp_path)
+
+    # Normal late receipt (within the reconcile grace): the bot records the action, then bind_late
+    # marks it executed once the deposit is folded.
     _input(c, ctx, 0, PORTAL, 10, deposit(A, 9 * USDC))
-    _input(c, ctx, 1, SEQ, 20, batch(0, (12, 0, [])))
-    c.orphans(grace_s=-1)
-    assert ctx.db.q1("SELECT 1 FROM alerts WHERE key='canon.foreign_direct' AND resolved_at IS NULL")
-    _action(ctx, 1, 0, "deposit", "l1", 9 * USDC, l1_input=0, l1_block=10)   # the receipt arrives late
+    _input(c, ctx, 1, SEQ, 20, batch(0, (12, 0, [])))                 # executes the deposit at block 10
+    _action(ctx, 1, 0, "deposit", "l1", 9 * USDC, l1_input=0, l1_block=10)
     c.bind_late(0)
     assert ctx.db.q1("SELECT state FROM actions WHERE step_id=1")["state"] == "executed"
+
+    # A deposit crediting a bot account with NO local record self-heals (funds came IN, never a
+    # theft vector): orphans() records it and raises no CRITICAL, and is idempotent.
+    _input(c, ctx, 2, PORTAL, 30, deposit(B, 4 * USDC))
+    _input(c, ctx, 3, SEQ, 40, batch(1, (32, 0, [])))                 # executes the deposit at block 30
     c.orphans(grace_s=-1)
+    rec = ctx.db.q1("SELECT * FROM actions WHERE run_id=1 AND l1_input=2")
+    assert rec is not None and rec["kind"] == "deposit" and rec["state"] == "executed"
+    assert ctx.db.q1("SELECT 1 FROM alerts WHERE key='canon.foreign_direct' AND resolved_at IS NULL") is None
+    c.orphans(grace_s=-1)
+    assert ctx.db.q1("SELECT COUNT(*) AS n FROM actions WHERE l1_input=2")["n"] == 1   # no duplicate
+
+    # A withdrawal (funds OUT) from a bot account with NO local trace is genuinely foreign: CRITICAL.
+    _input(c, ctx, 4, A, 50, C.encode_withdraw(TOKEN, 2 * USDC))
+    _input(c, ctx, 5, SEQ, 60, batch(2, (52, 0, [])))                # executes the direct withdraw
+    c.orphans(grace_s=-1)
+    al = ctx.db.q1("SELECT severity FROM alerts WHERE key='canon.foreign_direct' AND resolved_at IS NULL")
+    assert al is not None and al["severity"] == "critical"
+
+    # The same direct, but matching a terminal local step for that slot/kind/amount, is the bot's
+    # own mis-tracked input -> reconciled (bound to the step), clearing the CRITICAL.
+    ctx.db.x("INSERT INTO steps(run_id,seq,kind,route,slot,params,status,due_at,created_at,updated_at) "
+             "VALUES(1,0,'withdraw','l1',0,?,'failed',0,0,0)", (json.dumps({"amount": str(2 * USDC)}),))
+    c.orphans(grace_s=-1)
+    assert ctx.db.q1("SELECT 1 FROM actions WHERE run_id=1 AND l1_input=4") is not None
     assert ctx.db.q1("SELECT resolved_at FROM alerts WHERE key='canon.foreign_direct'")["resolved_at"] is not None

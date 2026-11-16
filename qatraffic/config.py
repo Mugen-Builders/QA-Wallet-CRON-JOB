@@ -176,6 +176,9 @@ class Config:
     # logging
     log_level: str = "info"
     log_retention_days: int = 14
+    # liveness HTTP endpoint (0 = off; set a port for fly.io [[checks]] / any external prober)
+    health_port: int = 0
+    health_max_stale_seconds: float = 600.0
 
     @property
     def db_path(self) -> Path:
@@ -327,6 +330,8 @@ def load(env=None, require_secrets: bool = True) -> Config:
         healthcheck_url=_env(env, "QA_TRAFFIC_HEALTHCHECK_URL"),
         log_level=(_env(env, "QA_TRAFFIC_LOG_LEVEL", "info") or "info").lower(),
         log_retention_days=_int(env, "QA_TRAFFIC_LOG_RETENTION_DAYS", 14),
+        health_port=_int(env, "QA_TRAFFIC_HEALTH_PORT", 0),
+        health_max_stale_seconds=_float(env, "QA_TRAFFIC_HEALTH_MAX_STALE_SECONDS", 600.0),
     )
     _validate(cfg)
     return cfg
@@ -361,3 +366,7 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("QA_TRAFFIC_MAX_OP_FEE_USDC must be > 0")
     if cfg.prt_settle_hours <= 0:
         raise ConfigError("QA_TRAFFIC_PRT_SETTLE_HOURS must be > 0")
+    if not 0 <= cfg.health_port <= 65535:
+        raise ConfigError("QA_TRAFFIC_HEALTH_PORT must be between 0 (off) and 65535")
+    if cfg.health_max_stale_seconds <= 0:
+        raise ConfigError("QA_TRAFFIC_HEALTH_MAX_STALE_SECONDS must be > 0")

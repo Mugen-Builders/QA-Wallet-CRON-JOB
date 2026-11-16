@@ -234,18 +234,90 @@ class Canon:
 
     def orphans(self, grace_s: float = 900):
         """Executed directs of bot accounts (sent by them, or deposits crediting them) with no bot
-        record: the bot lost a record, or someone else holds the key."""
+        record. Two causes: (1) the bot lost/mis-tracked a record of its OWN input (e.g. a tx
+        mis-marked 'dropped: nonce consumed' during an RPC wobble that actually landed) or (2) an
+        outside party holds the key and moved funds. We self-heal (1) so no manual DB surgery is
+        ever needed in production, and reserve the CRITICAL alert for (2):
+          - a DEPOSIT credits our own account (funds in) -- never a theft vector, so always
+            reconciled from chain into a recorded action;
+          - any other direct that matches a terminal local step for the same slot/kind/amount is
+            our own mis-tracked input -- reconciled, bound to that step;
+          - a funds-OUT direct (transfer/withdraw) with NO local trace is genuinely foreign and
+            stays CRITICAL.
+        Reconciling only records movement that already happened on chain; it never sends anything."""
         ctx = self.ctx
-        rows = ctx.db.q("SELECT e.direct_input, e.slot, e.kind FROM entries e JOIN l1_inputs i ON i.run_id=e.run_id AND "
-                        "i.input_index=e.direct_input LEFT JOIN actions a ON a.run_id=e.run_id AND a.l1_input=e.direct_input "
-                        "WHERE e.run_id=? AND e.source='direct' AND e.slot IS NOT NULL AND e.kind!='echo' AND a.id IS NULL "
-                        "AND i.seen_at<?", (ctx.run_id, time.time() - grace_s))
-        if rows:
+        rows = ctx.db.q(
+            "SELECT e.direct_input, e.slot, e.kind, e.offset, e.exec_input, e.amount, e.outcome, e.block, "
+            "i.block_ts, i.block AS l1_block "
+            "FROM entries e JOIN l1_inputs i ON i.run_id=e.run_id AND i.input_index=e.direct_input "
+            "LEFT JOIN actions a ON a.run_id=e.run_id AND a.l1_input=e.direct_input "
+            "WHERE e.run_id=? AND e.source='direct' AND e.slot IS NOT NULL AND e.kind!='echo' AND a.id IS NULL "
+            "AND i.seen_at<?", (ctx.run_id, time.time() - grace_s))
+        foreign = []
+        for r in rows:
+            step = self._originating_step(r)
+            if r["kind"] == "deposit" or step is not None:
+                self._reconcile_orphan(r, step)
+            else:
+                foreign.append(r)
+        if foreign:
             ctx.alerts.raise_("canon.foreign_direct", "critical", "Bot accounts have inputs the bot has no record of",
-                              "; ".join(f"input {r['direct_input']} slot {r['slot']} ({r['kind']})" for r in rows[:8])
-                              + ". Either the bot lost a record or someone else holds these keys.")
+                              "; ".join(f"input {r['direct_input']} slot {r['slot']} ({r['kind']})" for r in foreign[:8])
+                              + ". A funds-leaving input with no local trace -- the bot lost a record, "
+                              "or someone else holds these keys. Investigate the slot's key.")
         else:
             ctx.alerts.resolve("canon.foreign_direct", "every bot input is accounted for")
+
+    def _originating_step(self, r) -> dict | None:
+        """The terminal local step this on-chain input most likely came from: same slot and kind,
+        no action yet, and (when the step records an amount) the same amount. Evidence the input
+        was the bot's own -- e.g. step 'failed'/'reverted' while the tx actually landed under a
+        racing hash. None means no local trace at all."""
+        ctx = self.ctx
+        want = str(r["amount"]) if r["amount"] is not None else None
+        for s in ctx.db.q("SELECT * FROM steps WHERE run_id=? AND slot=? AND kind=? "
+                          "AND status IN ('failed','reverted','skipped') ORDER BY id DESC",
+                          (ctx.run_id, r["slot"], r["kind"])):
+            if ctx.db.q1("SELECT 1 FROM actions WHERE step_id=? LIMIT 1", (s["id"],)):
+                continue
+            try:
+                amt = json.loads(s["params"]).get("amount")
+            except (ValueError, TypeError):
+                amt = None
+            if want is None or amt is None or str(amt) == want:
+                return s
+        return None
+
+    def _reconcile_orphan(self, r, step):
+        """Record an on-chain input that credits/comes from a bot account but has no local action,
+        so the books match the chain and the CRITICAL clears. Binds to its originating step when
+        found, else synthesises a minimal step (actions.step_id is NOT NULL). Idempotent: the
+        UNIQUE(run_id,l1_input) index means a second pass over the same input is a no-op."""
+        ctx = self.ctx
+        if ctx.db.q1("SELECT 1 FROM actions WHERE run_id=? AND l1_input=? LIMIT 1", (ctx.run_id, r["direct_input"])):
+            return
+        now = time.time()
+        if step is None:
+            step_id = ctx.db.x(
+                "INSERT INTO steps(session_id,run_id,seq,kind,route,slot,params,status,due_at,note,created_at,updated_at) "
+                "VALUES(NULL,?,0,?,'l1',?,?,'mined',?,?,?,?)",
+                (ctx.run_id, r["kind"], r["slot"], json.dumps({"amount": str(r["amount"]), "reconciled": True}),
+                 now, "synthetic: reconciled from chain (no local step)", now, now)).lastrowid
+        else:
+            step_id = step["id"]
+            ctx.db.x("UPDATE steps SET status='mined', input_index=?, "
+                     "note=COALESCE(note,'') || ' | reconciled: input landed despite the local drop', updated_at=? WHERE id=?",
+                     (r["direct_input"], now, step_id))
+        ctx.db.x(
+            "INSERT OR IGNORE INTO actions(run_id,step_id,slot,kind,route,amount,counterparty,intended,l1_input,l1_block,"
+            "created_at,state,offset,exec_input,outcome,exec_block,executed_at,note) "
+            "VALUES(?,?,?,?,'l1',?,?,?,?,?,?,'executed',?,?,?,?,?,?)",
+            (ctx.run_id, step_id, r["slot"], r["kind"], str(r["amount"]), None, r["outcome"] or "accept",
+             r["direct_input"], r["l1_block"], now, r["offset"], r["exec_input"], r["outcome"],
+             r["block"], r["block_ts"] or now,
+             "reconciled from chain: input landed with no local record (nonce race / mis-marked drop)"))
+        ctx.log.warn("canon.reconciled_orphan", input=r["direct_input"], slot=r["slot"], kind=r["kind"],
+                     amount=str(r["amount"]), from_step=step_id, synthetic=step is None)
 
     def _bind_skip(self, s, replay):
         ctx = self.ctx
