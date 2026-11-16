@@ -1,0 +1,49 @@
+# fly.toml — qa-traffic-bot as a single always-on fly.io Machine.
+#
+# IMPORTANT: this is ONE long-running process, not a scheduled/cron Machine. It must stay
+# resident (it holds in-memory + SQLite state) and there must be EXACTLY ONE instance: the app
+# shares wallets and nonces across its single process, so a second Machine would double-spend
+# funds and corrupt nonce tracking. Never `fly scale count > 1`, never enable autoscaling.
+#
+# Fill in `app`, `primary_region`, and create the volume + secrets per docs/DEPLOY-FLY.md.
+
+app = "qa-traffic-bot"          # <- set to your fly app name
+primary_region = "iad"          # <- set to a region close to your RPC / node / sequencer
+
+[build]
+
+[env]
+  QA_TRAFFIC_HOME = "/data"
+  QA_TRAFFIC_HEALTH_PORT = "8080"
+  # Keep the liveness window comfortably longer than the slowest normal loop iteration (a large
+  # voucher/backlog catch-up after downtime can take a few minutes). 600s is a safe default.
+  QA_TRAFFIC_HEALTH_MAX_STALE_SECONDS = "600"
+  # Persistent disk: do NOT sweep funds on every restart (that is only for ephemeral hosts).
+  QA_TRAFFIC_SWEEP_ON_START = "false"
+  # Non-secret app config may live here too (app address, node/sequencer URLs, traffic shape).
+  # SECRETS (funder key, entropy, RPC URLs, Discord webhook) MUST be set with `fly secrets set`.
+
+# One Machine, always on. Size to taste; the bot is light (peaks ~120 MB).
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# State volume. Create it in the same region: `fly volumes create qa_traffic_data --size 1`.
+# A volume pins the app to one region/Machine, which is exactly what we want here.
+[mounts]
+  source = "qa_traffic_data"
+  destination = "/data"
+
+# Liveness check. The endpoint returns 200 while the loop makes progress and 503 once it has been
+# stuck past HEALTH_MAX_STALE. A failing check makes fly restart the Machine — the safety net that
+# replaces the systemd watchdog this app has on bare metal (the loop swallows errors and never
+# exits, so process-liveness alone cannot catch a freeze).
+[checks]
+  [checks.health]
+    type = "http"
+    port = 8080
+    path = "/health"
+    method = "get"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "90s"
