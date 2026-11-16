@@ -64,6 +64,14 @@ python3 -m qatraffic new-entropy     # prints 64 hex chars; set as QA_TRAFFIC_EN
 fly deploy
 fly scale count 1       # enforce exactly one Machine
 ```
+`fly deploy` builds the image from the `Dockerfile`. Alternatively, deploy the prebuilt image
+published to GHCR by the `Publish image` workflow (`.github/workflows/publish-image.yml`) — no local
+build needed:
+```bash
+fly deploy --image ghcr.io/mugen-builders/qa-wallet-cron-job:latest
+```
+(The package starts private; make it public or grant the deploy token access in the org's Packages
+settings. For a reproducible deploy, pin a `sha-<short>` or version tag instead of `latest`.)
 
 ## 6. Verify
 ```bash
