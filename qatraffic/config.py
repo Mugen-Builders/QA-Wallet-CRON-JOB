@@ -179,6 +179,8 @@ class Config:
     # liveness HTTP endpoint (0 = off; set a port for fly.io [[checks]] / any external prober)
     health_port: int = 0
     health_max_stale_seconds: float = 600.0
+    # wallet derivation cross-check with Foundry cast: require | auto | off (see load_wallets)
+    wallet_crosscheck: str = "require"
 
     @property
     def db_path(self) -> Path:
@@ -332,6 +334,7 @@ def load(env=None, require_secrets: bool = True) -> Config:
         log_retention_days=_int(env, "QA_TRAFFIC_LOG_RETENTION_DAYS", 14),
         health_port=_int(env, "QA_TRAFFIC_HEALTH_PORT", 0),
         health_max_stale_seconds=_float(env, "QA_TRAFFIC_HEALTH_MAX_STALE_SECONDS", 600.0),
+        wallet_crosscheck=(_env(env, "QA_TRAFFIC_WALLET_CROSSCHECK", "require") or "require").lower(),
     )
     _validate(cfg)
     return cfg
@@ -370,3 +373,5 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("QA_TRAFFIC_HEALTH_PORT must be between 0 (off) and 65535")
     if cfg.health_max_stale_seconds <= 0:
         raise ConfigError("QA_TRAFFIC_HEALTH_MAX_STALE_SECONDS must be > 0")
+    if cfg.wallet_crosscheck not in ("require", "auto", "off"):
+        raise ConfigError("QA_TRAFFIC_WALLET_CROSSCHECK must be one of require, auto, off")

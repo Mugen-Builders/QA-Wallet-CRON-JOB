@@ -22,8 +22,14 @@ COPY qatraffic ./qatraffic
 
 # All mutable state (SQLite DB, heartbeat, logs) lives under QA_TRAFFIC_HOME. Point it at the
 # mounted fly volume so it survives restarts (fly.toml [mounts] destination must match).
+#
+# QA_TRAFFIC_WALLET_CROSSCHECK=auto: this image ships without Foundry (to stay slim), so the
+# optional independent `cast` re-derivation is skipped with a warning -- the always-on BIP-39
+# known-answer vector and the Python derivation still verify the wallets. To enforce the cast
+# cross-check instead, install Foundry in the image and set this to "require".
 ENV QA_TRAFFIC_HOME=/data \
     QA_TRAFFIC_HEALTH_PORT=8080 \
+    QA_TRAFFIC_WALLET_CROSSCHECK=auto \
     PYTHONUNBUFFERED=1
 RUN mkdir -p /data
 

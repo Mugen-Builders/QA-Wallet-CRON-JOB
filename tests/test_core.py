@@ -45,6 +45,29 @@ def test_derivation_is_deterministic_and_matches_cast():
     assert "key" not in repr(w1[0])
 
 
+def test_wallet_crosscheck_modes(monkeypatch):
+    # Make cast look absent (the minimal-container case) without disturbing anything else: no PATH
+    # hit, and the ~/.foundry fallback resolves to a path that does not exist.
+    monkeypatch.setattr(A.shutil, "which", lambda _: None)
+    monkeypatch.setattr(A.os.path, "expanduser", lambda _p: "/nonexistent/qatraffic-no-cast")
+
+    # off and auto both succeed without cast (BIP-39 vector + Python derivation still verify)
+    assert len(A.load_wallets(ENTROPY, 0, 3, crosscheck="off")) == 3
+
+    class _Log:
+        warned = False
+        def warn(self, *a, **k): self.warned = True
+    lg = _Log()
+    assert len(A.load_wallets(ENTROPY, 0, 3, crosscheck="auto", log=lg)) == 3
+    assert lg.warned  # auto warns when cast is missing
+
+    # require hard-fails when cast is missing; an unknown mode is rejected
+    with pytest.raises(A.SelfCheckError):
+        A.load_wallets(ENTROPY, 0, 3, crosscheck="require")
+    with pytest.raises(A.SelfCheckError):
+        A.load_wallets(ENTROPY, 0, 1, crosscheck="sometimes")
+
+
 def test_config_rejects_bad_entropy(tmp_path):
     with pytest.raises(cfgmod.ConfigError):
         make_cfg(tmp_path, QA_TRAFFIC_ENTROPY="00" * 32)

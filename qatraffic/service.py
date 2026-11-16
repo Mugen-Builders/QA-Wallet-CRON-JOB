@@ -62,7 +62,8 @@ class Service:
         gap = self.health.startup_gap()
         self.log.info("service.start", version=__import__("qatraffic").__version__, accounts=cfg.account_count,
                       app=cfg.app_address or "not set", gap_s=round(gap) if gap else None)
-        wallets = A.load_wallets(cfg.entropy, cfg.account_offset, cfg.account_count, crosscheck=True)
+        wallets = A.load_wallets(cfg.entropy, cfg.account_offset, cfg.account_count,
+                                 crosscheck=cfg.wallet_crosscheck, log=self.log)
         self.log.info("accounts.ok", count=len(wallets), first=wallets[0].address, last=wallets[-1].address,
                       fingerprint=A.population_fingerprint(wallets)[:16])
         seed = A.sub_seed(cfg.entropy, "plan")

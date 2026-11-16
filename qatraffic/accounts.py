@@ -115,11 +115,39 @@ def sub_seed(entropy: bytes, label: str) -> bytes:
     return hashlib.sha256(b"qa-traffic/" + label.encode() + b"/" + entropy).digest()
 
 
-def load_wallets(entropy: bytes, offset: int, count: int, crosscheck: bool = True) -> list[Wallet]:
+def load_wallets(entropy: bytes, offset: int, count: int, crosscheck: bool | str = True, log=None) -> list[Wallet]:
+    """Derive the wallet set and self-check it.
+
+    The BIP-39 known-answer vector and the Python derivation (plus the duplicate check) ALWAYS run.
+    `crosscheck` controls only the extra independent re-derivation with Foundry's `cast`:
+      "require" / True  : cast must be present and match; a missing cast is a hard error. The
+                          historical default -- local/systemd installs have Foundry on PATH.
+      "auto"            : cross-check when cast is present, otherwise log a warning and continue.
+                          For a minimal container image that ships without Foundry.
+      "off" / False     : skip the cast cross-check entirely.
+    """
+    mode = {True: "require", False: "off"}.get(crosscheck, crosscheck)
+    if mode not in ("require", "auto", "off"):
+        raise SelfCheckError(f"unknown crosscheck mode {mode!r} (use require | auto | off)")
     bip39_vector_check()
     wallets = derive(entropy, offset, count)
     if len({w.address for w in wallets}) != len(wallets):
         raise SelfCheckError("duplicate addresses derived")
-    if crosscheck:
-        cast_crosscheck(entropy, wallets)
+    if mode == "off":
+        return wallets
+    cast_bin = shutil.which("cast") or os.path.expanduser("~/.foundry/bin/cast")
+    if os.path.exists(cast_bin):
+        cast_crosscheck(entropy, wallets, cast_bin)
+    elif mode == "require":
+        raise SelfCheckError("Foundry `cast` not found; it is required for the derivation cross-check "
+                             "(set QA_TRAFFIC_WALLET_CROSSCHECK=auto to skip it where cast is "
+                             "unavailable, e.g. a minimal container)")
+    else:  # auto: cast absent -> warn and continue (BIP-39 vector + Python derivation already ran)
+        msg = ("Foundry `cast` not found; skipping the independent derivation cross-check. The "
+               "BIP-39 known-answer vector and the Python derivation still verified the wallets. "
+               "Install Foundry or set QA_TRAFFIC_WALLET_CROSSCHECK=require to enforce it.")
+        if log is not None:
+            log.warn("accounts.crosscheck_skipped", detail=msg)
+        else:
+            print(msg)
     return wallets
