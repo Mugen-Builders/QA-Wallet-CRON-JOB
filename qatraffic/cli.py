@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
+import shutil
 import sys
 import time
 from collections import Counter
@@ -138,8 +140,12 @@ def cmd_selfcheck(_):
     wallets = []
 
     def derive():
-        wallets.extend(A.load_wallets(cfg.entropy, cfg.account_offset, cfg.account_count, crosscheck=True))
-        return f"{len(wallets)} accounts, every address matches cast"
+        wallets.extend(A.load_wallets(cfg.entropy, cfg.account_offset, cfg.account_count,
+                                      crosscheck=cfg.wallet_crosscheck))
+        matched = "every address matches cast" if cfg.wallet_crosscheck != "off" and (
+            shutil.which("cast") or os.path.exists(os.path.expanduser("~/.foundry/bin/cast"))
+        ) else f"cast cross-check {cfg.wallet_crosscheck} (not run)"
+        return f"{len(wallets)} accounts, {matched}"
     check("account derivation", derive)
     cfg.home.mkdir(parents=True, exist_ok=True)
     db = DB(cfg.db_path)
